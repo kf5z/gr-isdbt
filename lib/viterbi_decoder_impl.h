@@ -65,27 +65,27 @@ namespace gr {
                 static const unsigned char d_Partab[];
 
 #ifdef DTV_SSE2
-                static __m128i d_metric0[4];
-                static __m128i d_metric1[4];
-                static __m128i d_path0[4];
-                static __m128i d_path1[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_metric0[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_metric1[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_path0[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_path1[4];
 #else
-                static unsigned char d_metric0_generic[64];
-                static unsigned char d_metric1_generic[64];
-                static unsigned char d_path0_generic[64];
-                static unsigned char d_path1_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_metric0_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_metric1_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_path0_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_path1_generic[64];
 #endif
 
 #ifdef DTV_SSE2
-                static branchtab27 Branchtab27_sse2[2];
+                __GR_ATTR_ALIGNED(16) branchtab27 Branchtab27_sse2[2];
 #else
-                static branchtab27 Branchtab27_generic[2];
+                __GR_ATTR_ALIGNED(16) branchtab27 Branchtab27_generic[2];
 #endif
 
                 // Metrics for each state
-                static unsigned char mmresult[64];
+                __GR_ATTR_ALIGNED(16) unsigned char mmresult[64];
                 // Paths for each state
-                static unsigned char ppresult[TRACEBACK_MAX][64];
+                __GR_ATTR_ALIGNED(16) unsigned char ppresult[TRACEBACK_MAX][64];
 
                 // Current puncturing vector
                 const unsigned char* d_puncture;
@@ -120,8 +120,11 @@ namespace gr {
                 // Buffer to keep the input bits
                 unsigned char* d_inbits;
 
-                // This is used to get rid of traceback on the first frame
-                int d_init;
+                // Startup bytes still to discard, including across work calls.
+                int d_traceback_remaining;
+
+                // A boundary can refer to a byte not yet released by traceback.
+                std::vector<tag_t> d_pending_frame_tags;
 
                 // Position in circular buffer where the current decoded byte is stored
                 int store_pos;

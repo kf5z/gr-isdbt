@@ -25,6 +25,7 @@
 
 #include "viterbi_decoder_impl.h"
 #include <gnuradio/io_signature.h>
+#include <algorithm>
 
 namespace gr {
     namespace isdbt {
@@ -51,28 +52,6 @@ namespace gr {
         };
 
 #ifdef DTV_SSE2
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_metric0[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_metric1[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_path0[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_path1[4];
-#else
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_metric0_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_metric1_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_path0_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_path1_generic[64];
-#endif
-
-#ifdef DTV_SSE2
-        __GR_ATTR_ALIGNED(16) branchtab27 viterbi_decoder_impl::Branchtab27_sse2[2];
-#else
-        __GR_ATTR_ALIGNED(16) branchtab27 viterbi_decoder_impl::Branchtab27_generic[2];
-#endif
-
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::mmresult[64];
-        __GR_ATTR_ALIGNED(16)
-            unsigned char viterbi_decoder_impl::ppresult[TRACEBACK_MAX][64];
-
-#ifdef DTV_SSE2
         void viterbi_decoder_impl::viterbi_chunks_init_sse2(__m128i* mm0, __m128i* pp0)
         {
 #else
@@ -82,6 +61,13 @@ namespace gr {
 #endif
                 // Initialize starting metrics to prefer 0 state
                 int i, j;
+                store_pos = 0;
+                d_traceback_remaining = d_ntraceback;
+                d_pending_frame_tags.clear();
+                d_last_minmetric = 0;
+                d_last_bestmetric = 0;
+                d_new_ber = 0;
+                d_last_ber_out = 0.5;
 
 #ifdef DTV_SSE2
                 for (i = 0; i < 4; i++) {
@@ -293,8 +279,10 @@ namespace gr {
                     }
 
                     for (j = 0; j < 16; j++) {
-                        decision0[j] = ((m0[j] - m1[j]) > 0) ? 0xff : 0x0;
-                        decision1[j] = ((m2[j] - m3[j]) > 0) ? 0xff : 0x0;
+                        const unsigned char diff0 = m0[j] - m1[j];
+                        const unsigned char diff1 = m2[j] - m3[j];
+                        decision0[j] = (diff0 != 0 && diff0 < 128) ? 0xff : 0x0;
+                        decision1[j] = (diff1 != 0 && diff1 < 128) ? 0xff : 0x0;
                         survivor0[j] = (decision0[j] & m0[j]) | ((~decision0[j]) & m1[j]);
                         survivor1[j] = (decision1[j] & m2[j]) | ((~decision1[j]) & m3[j]);
                     }
@@ -379,8 +367,10 @@ namespace gr {
                     }
 
                     for (j = 0; j < 16; j++) {
-                        decision0[j] = ((m0[j] - m1[j]) > 0) ? 0xff : 0x0;
-                        decision1[j] = ((m2[j] - m3[j]) > 0) ? 0xff : 0x0;
+                        const unsigned char diff0 = m0[j] - m1[j];
+                        const unsigned char diff1 = m2[j] - m3[j];
+                        decision0[j] = (diff0 != 0 && diff0 < 128) ? 0xff : 0x0;
+                        decision1[j] = (diff1 != 0 && diff1 < 128) ? 0xff : 0x0;
                         survivor0[j] = (decision0[j] & m0[j]) | ((~decision0[j]) & m1[j]);
                         survivor1[j] = (decision1[j] & m2[j]) | ((~decision1[j]) & m3[j]);
                     }
@@ -535,11 +525,6 @@ namespace gr {
                     : block("viterbi_decoder",
                             io_signature::make(1, 1, sizeof(unsigned char)),
                             io_signature::make2(1, 2, sizeof(unsigned char), sizeof(float)))
-                      //,
-                    //config(constellation, hierarchy, coderate, coderate),
-                    //d_bsize(bsize),
-                    //d_init(0),
-                    //store_pos(0)
                 {
                     // d_k: the input of the encoder
                     // d_n: the output of the encoder
@@ -577,8 +562,6 @@ namespace gr {
                             break;
                     }
 
-                    // initial state
-                    d_init = 0; 
                     // constellation size
                     d_m = log2(constellation_size);
            
@@ -659,183 +642,121 @@ namespace gr {
                         gr_vector_const_void_star& input_items,
                         gr_vector_void_star& output_items)
                 {
-                    int nstreams = input_items.size();
-                    int nblocks = 8 * noutput_items / (d_bsize * d_k);
+                    const unsigned char* in = static_cast<const unsigned char*>(input_items[0]);
+                    unsigned char* out = static_cast<unsigned char*>(output_items[0]);
+                    const bool ber_out_connected = output_items.size() >= 2 &&
+                                                   output_items[1] != nullptr;
+                    float* ber_out = ber_out_connected
+                        ? static_cast<float*>(output_items[1]) : nullptr;
+                    int nblocks = std::min(noutput_items / d_nout,
+                                           ninput_items[0] / d_nsymbols);
+                    const uint64_t nread = nitems_read(0);
+                    const uint64_t nwritten = nitems_written(0);
+                    consume_each(0);
+                    if (nblocks == 0)
+                        return 0;
+
+                    std::vector<tag_t> resync_tags;
+                    get_tags_in_range(resync_tags, 0, nread,
+                                      nread + nblocks * d_nsymbols,
+                                      pmt::string_to_symbol("resync"));
+                    std::sort(resync_tags.begin(), resync_tags.end(),
+                              [](const tag_t& a, const tag_t& b) {
+                                  return a.offset < b.offset;
+                              });
+                    size_t next_resync = 0;
+                    if (!resync_tags.empty() && resync_tags[0].offset == nread) {
+#ifdef DTV_SSE2
+                        viterbi_chunks_init_sse2(d_metric0, d_path0);
+#else
+                        viterbi_chunks_init_generic(d_metric0_generic, d_path0_generic);
+#endif
+                        while (next_resync < resync_tags.size() &&
+                               resync_tags[next_resync].offset == nread)
+                            ++next_resync;
+                    }
+                    // Never decode through a later reset in the same work call.
+                    if (next_resync < resync_tags.size()) {
+                        const uint64_t until_reset = resync_tags[next_resync].offset - nread;
+                        nblocks = std::min(nblocks, static_cast<int>(until_reset / d_nsymbols));
+                        if (nblocks == 0) {
+                            // Discard only an incomplete coding block before resync.
+                            consume_each(static_cast<int>(until_reset));
+                            return 0;
+                        }
+                    }
+
+                    // Account for startup bytes already discarded in previous calls.
+                    const int tag_delay = d_ntraceback - d_traceback_remaining;
                     int out_count = 0;
-
-                    float *ber_out = (float *)output_items[1]; 
-                    bool ber_out_connected = output_items.size()>=2; 
-                    int correct_bits = 0; 
-
-                    for (int m = 0; m < nstreams; m++) {
-                        const unsigned char* in = (const unsigned char*)input_items[m];
-                        unsigned char* out = (unsigned char*)output_items[m];
-
-                        /*
-                         * Look for a tag that signals superframe_start and consume all input items
-                         * that are in input buffer so far.
-                         * This will actually reset the viterbi decoder.
-                         */
-                        std::vector<tag_t> tags;
-                        const uint64_t nread = this->nitems_read(0); // number of items read on port 0
-                        this->get_tags_in_range(tags,
-                                0,
-                                nread,
-                                nread + (nblocks * d_nsymbols),
-                                pmt::string_to_symbol("resync"));
-
-                        if (!tags.empty()) {
-                            d_init = 0;
-
-#ifdef DTV_SSE2
-                            viterbi_chunks_init_sse2(d_metric0, d_path0);
-#else
-                            viterbi_chunks_init_generic(d_metric0_generic, d_path0_generic);
-#endif
-
-                            // if we are not aligned with the beginning of a frame, we go 
-                            // to that point by consuming all the inputs
-                            if (tags[0].offset - nread) {
-                                consume_each(tags[0].offset - nread);
-                                return (0);
+                    for (int n = 0; n < nblocks; ++n) {
+                        // Unpack constellation labels and insert punctured erasures.
+                        for (int count = 0, i = 0; i < d_nsymbols; ++i) {
+                            for (int j = d_m - 1; j >= 0; --j) {
+                                while (d_puncture[count % (2 * d_k)] == 0)
+                                    d_inbits[count++] = 2;
+                                d_inbits[count++] = (in[n * d_nsymbols + i] >> j) & 1;
+                                while (d_puncture[count % (2 * d_k)] == 0)
+                                    d_inbits[count++] = 2;
                             }
                         }
-
-                        // This is actually the Viterbi decoder
-                        for (int n = 0; n < nblocks; n++) {
-                            /*
-                             * Depuncture and unpack a block.
-                             * We receive the symbol (d_m bits/byte) in one byte (e.g. for QAM16
-                             * 00001111). Create a buffer of bytes containing just one bit/byte. Also
-                             * depuncture according to the puncture vector.
-                             * TODO - reduce the number of branches while depuncturing.
-                             */
-                            for (int count = 0, i = 0; i < d_nsymbols; i++) {
-                                for (int j = (d_m - 1); j >= 0; j--) {
-                                    // Depuncture
-                                    while (d_puncture[count % (2 * d_k)] == 0) {
-                                        d_inbits[count++] = 2;
-                                    }
-
-                                    // Insert received bits
-                                    d_inbits[count++] = (in[(n * d_nsymbols) + i] >> j) & 1;
-
-                                    // Depuncture
-                                    while (d_puncture[count % (2 * d_k)] == 0) {
-                                        d_inbits[count++] = 2;
-                                    }
-                                }
-                            }
-
-                            /*
-                             * Decode a block.
-                             */
-                            for (int in_count = 0; in_count < d_nbits; in_count++) {
-                                if ((in_count % 4) == 0) { // 0 or 3
-
+                        for (int in_count = 0; in_count < d_nbits; in_count += 4) {
 #ifdef DTV_SSE2
-                                    viterbi_butterfly2_sse2(&d_inbits[in_count & 0xfffffffc],
-                                            d_metric0,
-                                            d_metric1,
-                                            d_path0,
-                                            d_path1);
+                            viterbi_butterfly2_sse2(&d_inbits[in_count], d_metric0,
+                                                   d_metric1, d_path0, d_path1);
 #else
-                                    viterbi_butterfly2_generic(&d_inbits[in_count & 0xfffffffc],
-                                            d_metric0_generic,
-                                            d_metric1_generic,
-                                            d_path0_generic,
-                                            d_path1_generic);
+                            viterbi_butterfly2_generic(&d_inbits[in_count], d_metric0_generic,
+                                                      d_metric1_generic, d_path0_generic,
+                                                      d_path1_generic);
 #endif
-
-                                    if ((in_count > 0) && (in_count % 16) == 8) { // 8 or 11
-                                        unsigned char c;
-
+                            if (in_count % 16 != 8)
+                                continue;
+                            unsigned char c;
 #ifdef DTV_SSE2
-                                        correct_bits = viterbi_get_output_sse2(
-                                                d_metric0, d_path0, d_ntraceback, &c);
+                            const int correct_bits = viterbi_get_output_sse2(
+                                d_metric0, d_path0, d_ntraceback, &c);
 #else
-                                        correct_bits = viterbi_get_output_generic(
-                                                d_metric0_generic, d_path0_generic, d_ntraceback, &c);
+                            const int correct_bits = viterbi_get_output_generic(
+                                d_metric0_generic, d_path0_generic, d_ntraceback, &c);
 #endif
-
-                                        if (d_init == 0) {
-                                            if (out_count >= d_ntraceback) {
-                                                out[out_count - d_ntraceback] = c;
-                                                if(ber_out_connected){
-                                                    //d_new_ber = 1.0-correct_bits/(16.0*d_n/(2*d_k)); 
-                                                    d_new_ber = 1.0-correct_bits/(8.0*d_n/d_k); 
-                                                    //ber_out[out_count-d_ntraceback] = 1.0-correct_bits/(8.0*d_n/d_k); 
-                                                    ber_out[out_count-d_ntraceback] = d_alpha_avg*d_new_ber + (1-d_alpha_avg)*d_last_ber_out;
-                                                    d_last_ber_out = ber_out[out_count-d_ntraceback]; 
-                                                    // the factorization above raises from considering how many bits 
-                                                    // are actually used in the metric when depuncturing is performed. 
-                                                    // Not all 16 bits (to generate 8 bits at its output, the mother code needs
-                                                    // 16 bits at its input) are depunctured equally (the pattern may change from 
-                                                    // code-word to code-word) so expect some negative bers, 
-                                                    // which should even out as larger averages are used. 
-                                                  }
-
-                                                }
-                                            } else {
-                                                out[out_count] = c;
-                                                if(ber_out_connected)
-                                                {
-                                                    d_new_ber = 1.0-correct_bits/(8.0*d_n/d_k); 
-                                                    ber_out[out_count] = d_alpha_avg*d_new_ber + (1-d_alpha_avg)*d_last_ber_out;
-                                                    //printf("ber_out-pre=%f\n",ber_out[out_count]); 
-                                                    d_last_ber_out = ber_out[out_count]; 
-                                                }
-
-                                            }
-                                            out_count++;
-                                        }
-                                    }
+                            if (d_traceback_remaining > 0) {
+                                --d_traceback_remaining;
+                                continue;
                             }
+                            out[out_count] = c;
+                            if (ber_out_connected) {
+                                d_new_ber = 1.0 - correct_bits / (8.0 * d_n / d_k);
+                                ber_out[out_count] = d_alpha_avg * d_new_ber +
+                                    (1 - d_alpha_avg) * d_last_ber_out;
+                                d_last_ber_out = ber_out[out_count];
+                            }
+                            ++out_count;
                         }
                     }
 
-                    int to_out = noutput_items;
-
-                    if (d_init == 0) {
-                        ///*
-                        // * Send superframe_start to signal this situation
-                        // * downstream
-                        // */
-                        //const uint64_t offset = this->nitems_written(0);
-                        //pmt::pmt_t key = pmt::string_to_symbol("frame_begin");
-                        //pmt::pmt_t value = pmt::from_long(1);
-                        //this->add_item_tag(0, offset, key, value);
-
-                        // Take in consideration the traceback length
-                        printf("VITERBI: d_init=True\n");
-                        to_out = to_out - d_ntraceback;
-                        d_init = 1;
+                    std::vector<tag_t> frame_tags;
+                    get_tags_in_range(frame_tags, 0, nread,
+                                      nread + nblocks * d_nsymbols,
+                                      pmt::string_to_symbol("frame_begin"));
+                    for (auto tag : frame_tags) {
+                        tag.offset = nwritten + tag_delay +
+                            (tag.offset - nread) * d_m * d_k / (d_n * 8);
+                        tag.value = pmt::string_to_symbol("generated by the viterbi decoder");
+                        d_pending_frame_tags.push_back(tag);
                     }
-
-                    /*
-                     * Send frame_begin to signal frame_begin situation
-                     * downstream
-                     */
-                    std::vector<tag_t> tags;
-                    const uint64_t nread = this->nitems_read(0); //number of items read on port 0
-                    this->get_tags_in_range(tags, 0, nread, nread + (nblocks * d_nsymbols), pmt::string_to_symbol("frame_begin"));
-                    if(tags.size()){
-                        const uint64_t offset = this->nitems_written(0) + d_ntraceback + (tags[0].offset- this->nitems_read(0))*d_m*d_k/(d_n*8.0);
-                        //std::cout << "offset: "<< offset-this->nitems_written(0) << " nitems_written: "<<this->nitems_written(0)<<std::endl; 
-                        //const uint64_t offset = tags[0].offset; 
-                        pmt::pmt_t key = pmt::string_to_symbol("frame_begin");
-                        pmt::pmt_t value = pmt::string_to_symbol("generated by the viterbi decoder");
-                        this->add_item_tag(0, offset, key, value);
+                    std::stable_sort(d_pending_frame_tags.begin(), d_pending_frame_tags.end(),
+                                     [](const tag_t& a, const tag_t& b) {
+                                         return a.offset < b.offset;
+                                     });
+                    auto emitted_end = d_pending_frame_tags.begin();
+                    for (; emitted_end != d_pending_frame_tags.end() &&
+                           emitted_end->offset < nwritten + out_count; ++emitted_end) {
+                        add_item_tag(0, emitted_end->offset, emitted_end->key,
+                                     emitted_end->value);
                     }
-
-
-
-                    // Tell runtime system how many input items we consumed on
-                    // each input stream.
+                    d_pending_frame_tags.erase(d_pending_frame_tags.begin(), emitted_end);
                     consume_each(nblocks * d_nsymbols);
-
-                    // Tell runtime system how many output items we produced.
-                    return (to_out);
+                    return out_count;
                 }
 
             } /* namespace isdbt */

@@ -35,6 +35,7 @@
 #include "energy_descrambler_impl.h"
 
 #include <stdio.h>
+#include <algorithm>
 
 namespace gr {
   namespace isdbt {
@@ -109,37 +110,23 @@ namespace gr {
                 const unsigned char *in = (const unsigned char *) input_items[0];
                 unsigned char *out = (unsigned char *) output_items[0];
 
-                int to_consume = noutput_items; 
-                int to_out = noutput_items;
-
-                //printf("ENERGY: noutput_items: %i, nitems_written: %li, nitems_read:%li\n", noutput_items, this->nitems_written(0), this->nitems_read(0));
-
-                // Search for frame_begin, when the PRBS should be restarted. 
+                const int to_out = std::min(noutput_items, ninput_items[0]);
+                const int to_consume = to_out;
+                const uint64_t nread = nitems_read(0);
                 std::vector<tag_t> tags;
-                const uint64_t nread = this->nitems_read(0); //number of items read on port 0
-                this->get_tags_in_range(tags, 0, nread, nread + noutput_items, pmt::string_to_symbol("frame_begin"));
-                //printf("tags.size(): %i \n", tags.size()) ; 
+                get_tags_in_range(tags, 0, nread, nread + to_out,
+                                  pmt::string_to_symbol("frame_begin"));
+                std::sort(tags.begin(), tags.end(), [](const tag_t& a, const tag_t& b) {
+                    return a.offset < b.offset;
+                });
 
-                if (tags.size())
-                {
-                    //std::cout << "ENERGY DESCRAMBLER: "<< tags[0].value <<std::endl ; 
-                    if (tags[0].offset - nread)
-                    {
-                        //consume_each(tags[0].offset - nread);
-                        //return (0);
-                        to_consume = tags[0].offset - nread; 
-                        to_out = to_consume; 
-                    }
-                    else 
-                    {
+                size_t next_tag = 0;
+                for (int i = 0; i < to_out; ++i) {
+                    while (next_tag < tags.size() && tags[next_tag].offset == nread + i) {
                         init_prbs();
+                        ++next_tag;
                     }
-                }
 
-				//printf("--- ENERGY DESCRAMBLER-> noutput_items = %d\n",noutput_items);
-                for (int i = 0; i < to_out; i++)
-                {
-                    
                     // The sync byte should be taken from the end and put in the beginning. 
                     //out[i*d_TSP_SIZE] = d_SYNC; 
                     out[i*d_TSP_SIZE] = in[d_TSP_SIZE-1 + i*d_TSP_SIZE];
